@@ -2,46 +2,37 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>人狼シナリオメーカー</title>
   <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-  <header class="app-header">
-    <h1>人狼シナリオメーカー</h1>
-    <div class="header-actions">
-      <button id="btn-export" type="button">JSON書き出し</button>
-      <label class="button">JSON読み込み<input id="input-import" type="file" accept="application/json" hidden></label>
-      <button id="btn-reset" type="button" class="danger">リセット</button>
-    </div>
-  </header>
-
   <nav class="tabs">
-    <button type="button" class="tab active" data-tab="setup">① 配役</button>
-    <button type="button" class="tab" data-tab="scenario">② シナリオ</button>
-    <button type="button" class="tab" data-tab="preview">③ 台本プレビュー</button>
+    <button type="button" class="tab active" data-tab="setup">配役</button>
+    <button type="button" class="tab" data-tab="scenario">シナリオ</button>
+    <button type="button" class="tab" data-tab="preview">台本</button>
   </nav>
 
   <main>
     <section id="tab-setup" class="tab-panel active">
       <div class="card">
-        <label class="field">タイトル<input id="title" type="text" placeholder="例：第1回 人狼村"></label>
-        <label class="field">メモ（コンセプト・見どころなど）<textarea id="memo" rows="3"></textarea></label>
+        <input id="title" type="text" placeholder="タイトル">
       </div>
       <div class="card">
-        <div class="card-head">
-          <h2>登場人物と役職</h2>
-          <div>
-            <button id="btn-add-player" type="button">＋ 追加</button>
-            <button id="btn-random-roles" type="button">役職をランダム配布</button>
-          </div>
-        </div>
-        <div id="role-summary" class="role-summary"></div>
-        <table class="players">
-          <thead><tr><th>色</th><th>名前</th><th>役職</th><th>キャラ設定メモ</th><th></th></tr></thead>
-          <tbody id="player-list"></tbody>
-        </table>
+        <h2>メンバー <span id="role-summary" class="muted"></span></h2>
+        <div id="player-list"></div>
+        <button id="btn-add-player" type="button" class="wide">＋ メンバー追加</button>
       </div>
+      <div class="card">
+        <h2>プリセット</h2>
+        <div class="row">
+          <select id="preset-select"></select>
+          <button id="btn-preset-load" type="button">読込</button>
+          <button id="btn-preset-delete" type="button" class="danger">削除</button>
+        </div>
+        <button id="btn-preset-save" type="button" class="wide">今のメンバーをプリセット保存</button>
+      </div>
+      <button id="btn-reset" type="button" class="wide danger">シナリオをリセット</button>
     </section>
 
     <section id="tab-scenario" class="tab-panel">
@@ -50,13 +41,8 @@
     </section>
 
     <section id="tab-preview" class="tab-panel">
-      <div class="card">
-        <div class="card-head">
-          <h2>台本プレビュー</h2>
-          <button id="btn-copy" type="button">コピー</button>
-        </div>
-        <pre id="preview"></pre>
-      </div>
+      <button id="btn-copy" type="button" class="wide">台本をコピー</button>
+      <pre id="preview"></pre>
     </section>
   </main>
 

@@ -1,31 +1,30 @@
 'use strict';
 
 /* ===== 定義 ===== */
+// 勝敗判定では人狼以外をすべて「人間」として数える
 const ROLES = {
-  villager: { name: '村人', team: 'village' },
-  werewolf: { name: '人狼', team: 'wolf' },
-  seer: { name: '占い師', team: 'village' },
-  medium: { name: '霊媒師', team: 'village' },
-  knight: { name: '騎士', team: 'village' },
-  madman: { name: '狂人', team: 'wolf' }, // 勝敗カウントでは人間扱い
+  villager: '村人',
+  werewolf: '人狼',
+  seer: '占い師',
+  medium: '霊能者',
+  hunter: '狩人',
+  madman: '狂人',
+  nekomata: '猫又',
+  fox: '妖狐',
 };
-const STORAGE_KEY = 'jinro-senario:v1';
-const DEFAULT_COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f1c40f', '#9b59b6', '#e67e22', '#1abc9c', '#ecf0f1', '#ff6fa8', '#95a5a6'];
+const STORAGE_KEY = 'jinro-senario:v2';
+const PRESET_KEY = 'jinro-senario:presets';
+const COLORS = ['#e74c3c', '#3498db', '#2ecc71', '#f1c40f', '#9b59b6', '#e67e22', '#1abc9c', '#ecf0f1', '#ff6fa8', '#95a5a6'];
 
 /* ===== 状態 ===== */
-let state = load() || createInitialState();
-
-function uid() {
-  return Math.random().toString(36).slice(2, 10);
-}
+const uid = () => Math.random().toString(36).slice(2, 10);
 
 function createInitialState() {
-  const names = ['アカネ', 'ソウタ', 'ミドリ', 'キイロ', 'ムラサキ'];
   const roles = ['werewolf', 'seer', 'madman', 'villager', 'villager'];
   return {
     title: '',
-    memo: '',
-    players: names.map((name, i) => ({ id: uid(), name, role: roles[i], color: DEFAULT_COLORS[i], note: '' })),
+    players: roles.map((role, i) => ({ id: uid(), name: `キャラ${i + 1}`, role, color: COLORS[i] })),
+    firstNight: { victim: '', divine: '', lines: [] },
     days: [createDay()],
   };
 }
@@ -33,98 +32,127 @@ function createInitialState() {
 function createDay() {
   return {
     id: uid(),
-    lines: [], // { id, speaker, text }  speaker: playerId or '' (ナレーション)
-    votes: {}, // voterId -> targetId
-    executed: 'auto', // 'auto' | 'none' | playerId
-    night: { attack: '', divine: '', guard: '' },
+    lines: [],
+    votes: {}, // 投票者ID -> 投票先ID
+    executed: 'auto', // 'auto' | 'none' | 処刑者ID
+    nekoExec: '', // 処刑された猫又の道連れ先
+    night: { attack: '', divine: '', guard: '', nekoWolf: '' }, // nekoWolf: 噛まれた猫又の道連れ先（人狼）
     nightLines: [],
   };
 }
 
-function save() {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); } catch (e) { /* ignore */ }
-}
-
-function load() {
+function loadJSON(key, fallback) {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? normalize(JSON.parse(raw)) : null;
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
   } catch (e) {
-    return null;
+    return fallback;
   }
 }
 
-function normalize(s) {
-  const base = createInitialState();
-  s.title = s.title || '';
-  s.memo = s.memo || '';
-  s.players = Array.isArray(s.players) ? s.players : base.players;
-  s.days = Array.isArray(s.days) && s.days.length ? s.days : [createDay()];
-  s.days = s.days.map((d) => Object.assign(createDay(), d, { night: Object.assign(createDay().night, d.night) }));
-  return s;
+function saveJSON(key, value) {
+  try { localStorage.setItem(key, JSON.stringify(value)); } catch (e) { /* 保存できない環境では無視 */ }
 }
 
-/* ===== ゲーム進行の計算 ===== */
+let state = loadJSON(STORAGE_KEY, null) || createInitialState();
+let presets = loadJSON(PRESET_KEY, []);
+
+/* ===== ルール計算 ===== */
 const player = (id) => state.players.find((p) => p.id === id);
 const pname = (id) => (player(id) ? player(id).name : '？');
-const isWolf = (id) => player(id) && player(id).role === 'werewolf';
+const roleOf = (id) => (player(id) ? player(id).role : null);
+const isWolf = (id) => roleOf(id) === 'werewolf';
+const result = (id) => (isWolf(id) ? '人狼' : '人間'); // 占い・霊能結果
 
-/** 投票の集計と処刑者の決定 */
-function tally(day, alive) {
-  const count = {};
-  for (const voter of alive) {
-    const t = day.votes[voter];
-    if (t && alive.includes(t)) count[t] = (count[t] || 0) + 1;
-  }
-  const max = Math.max(0, ...Object.values(count));
-  const top = Object.keys(count).filter((k) => count[k] === max && max > 0);
-  let executed = null;
-  if (day.executed === 'auto') executed = top.length === 1 ? top[0] : null;
-  else if (day.executed !== 'none' && alive.includes(day.executed)) executed = day.executed;
-  return { count, top, executed };
-}
-
-function judgeWinner(alive) {
+/** 勝敗判定。決着時に人狼勝利/村人勝利の条件を満たしても妖狐が生存していれば妖狐勝利 */
+function judge(alive) {
   const wolves = alive.filter(isWolf).length;
-  const humans = alive.length - wolves;
-  if (wolves === 0) return 'village';
-  if (wolves >= humans) return 'wolf';
-  return null;
+  let w = null;
+  if (wolves === 0) w = 'village';
+  else if (wolves >= alive.length - wolves) w = 'wolf';
+  if (w && alive.some((id) => roleOf(id) === 'fox')) w = 'fox';
+  return w;
 }
 
-/** 全日程をシミュレーションして各日の結果を返す */
+/** 夜の処理（占い→襲撃）。死亡者を deaths に積む */
+function resolveNight(alive, { attack, divine, guard, nekoWolf }, deaths, info) {
+  const has = (role) => alive.some((id) => roleOf(id) === role);
+  const dead = new Set();
+
+  if (divine && has('seer') && alive.includes(divine)) {
+    info.divine = { target: divine, result: result(divine) };
+    if (roleOf(divine) === 'fox') { dead.add(divine); deaths.push({ id: divine, cause: '呪殺' }); }
+  }
+  if (attack && alive.includes(attack)) {
+    if (guard && guard === attack && has('hunter')) info.attackFail = '護衛成功';
+    else if (roleOf(attack) === 'fox') info.attackFail = '妖狐は襲撃で死なない';
+    else {
+      dead.add(attack);
+      deaths.push({ id: attack, cause: '襲撃' });
+      if (roleOf(attack) === 'nekomata') {
+        if (nekoWolf && isWolf(nekoWolf) && alive.includes(nekoWolf)) {
+          dead.add(nekoWolf);
+          deaths.push({ id: nekoWolf, cause: '猫又の道連れ' });
+        } else info.needNekoWolf = true;
+      }
+    }
+  }
+  return alive.filter((id) => !dead.has(id));
+}
+
+/** 全体をシミュレーション */
 function simulate() {
   let alive = state.players.map((p) => p.id);
-  let winner = judgeWinner(alive);
-  const results = [];
-  for (const day of state.days) {
-    const r = { aliveAtStart: alive.slice(), winnerBefore: winner };
-    if (winner) { r.skipped = true; results.push(r); continue; }
-
-    const t = tally(day, alive);
-    r.tally = t;
-    if (t.executed) {
-      alive = alive.filter((id) => id !== t.executed);
-      r.medium = isWolf(t.executed) ? '人狼' : '人間';
-    }
-    winner = judgeWinner(alive);
-    r.winnerAfterDay = winner;
-    r.aliveAtNight = alive.slice();
-
-    if (!winner) {
-      const n = day.night;
-      if (n.divine && alive.includes(n.divine)) r.divine = isWolf(n.divine) ? '人狼' : '人間';
-      if (n.attack && alive.includes(n.attack)) {
-        const guarded = n.guard && n.guard === n.attack && alive.some((id) => player(id).role === 'knight');
-        if (guarded) r.guarded = true;
-        else { r.killed = n.attack; alive = alive.filter((id) => id !== n.attack); }
-      }
-      winner = judgeWinner(alive);
-      r.winnerAfterNight = winner;
-    }
-    results.push(r);
+  const fn = state.firstNight;
+  const first = { deaths: [] };
+  if (fn.victim && alive.includes(fn.victim)) {
+    alive = alive.filter((id) => id !== fn.victim);
+    first.deaths.push({ id: fn.victim, cause: '初日犠牲者' });
   }
-  return { results, winner, alive };
+  alive = resolveNight(alive, { divine: fn.divine }, first.deaths, first);
+  let winner = judge(alive);
+  first.winner = winner;
+
+  const days = state.days.map((day) => {
+    const r = { aliveAtStart: alive.slice(), deathsDay: [], deathsNight: [] };
+    if (winner) { r.skipped = true; return r; }
+
+    // 投票集計
+    const count = {};
+    alive.forEach((v) => {
+      const t = day.votes[v];
+      if (t && alive.includes(t) && t !== v) count[t] = (count[t] || 0) + 1;
+    });
+    const max = Math.max(0, ...Object.values(count));
+    r.count = count;
+    r.top = Object.keys(count).filter((k) => max > 0 && count[k] === max);
+    let exe = null;
+    if (day.executed === 'auto') exe = r.top.length === 1 ? r.top[0] : null;
+    else if (alive.includes(day.executed)) exe = day.executed;
+    r.executed = exe;
+
+    if (exe) {
+      alive = alive.filter((id) => id !== exe);
+      r.deathsDay.push({ id: exe, cause: '処刑' });
+      r.medium = result(exe);
+      if (roleOf(exe) === 'nekomata') {
+        if (day.nekoExec && alive.includes(day.nekoExec)) {
+          alive = alive.filter((id) => id !== day.nekoExec);
+          r.deathsDay.push({ id: day.nekoExec, cause: '猫又の道連れ' });
+        } else r.needNekoExec = true;
+      }
+    }
+    winner = judge(alive);
+    r.winnerDay = winner;
+    r.aliveAtNight = alive.slice();
+    if (winner) return r;
+
+    alive = resolveNight(alive, day.night, r.deathsNight, r);
+    winner = judge(alive);
+    r.winnerNight = winner;
+    return r;
+  });
+  return { first, days, winner };
 }
 
 /* ===== DOM ヘルパー ===== */
@@ -143,141 +171,153 @@ function h(tag, attrs = {}, ...children) {
   return el;
 }
 
-function playerSelect(value, ids, onChange, emptyLabel = '―') {
+function select(value, options, onChange) {
   return h('select', { onchange: (e) => onChange(e.target.value) },
-    h('option', { value: '' }, emptyLabel),
-    ids.map((id) => h('option', { value: id, selected: id === value }, pname(id))));
+    options.map(([v, label]) => h('option', { value: v, selected: v === value }, label)));
 }
 
-function chip(id, extraClass = '') {
-  const p = player(id);
-  return h('span', { class: `chip ${extraClass}` }, h('span', { class: 'dot', style: `background:${p.color}` }), p.name);
+function playerSelect(value, ids, onChange, emptyLabel = '（なし）') {
+  return select(value, [['', emptyLabel], ...ids.map((id) => [id, pname(id)])], onChange);
+}
+
+const field = (label, control) => h('div', { class: 'row' }, h('span', { class: 'label' }, label), control);
+const note = (text, cls = '') => h('div', { class: `result ${cls}` }, text);
+
+function chips(alive) {
+  return h('div', { class: 'chips' }, state.players.map((p) => h('span', { class: `chip ${alive.includes(p.id) ? '' : 'dead'}` },
+    h('span', { class: 'dot', style: `background:${p.color}` }), p.name)));
 }
 
 function commit(rerender = true) {
-  save();
+  saveJSON(STORAGE_KEY, state);
   if (rerender) render();
 }
 
-/* ===== ① 配役 ===== */
+/* ===== 配役 ===== */
 function renderSetup() {
   document.getElementById('title').value = state.title;
-  document.getElementById('memo').value = state.memo;
 
   const counts = {};
   state.players.forEach((p) => { counts[p.role] = (counts[p.role] || 0) + 1; });
-  const summary = document.getElementById('role-summary');
-  summary.replaceChildren(
-    h('span', { class: 'chip' }, `${state.players.length}人`),
-    ...Object.entries(counts).map(([r, c]) => h('span', { class: `chip ${r === 'werewolf' ? 'wolf' : ''}` }, `${ROLES[r].name}×${c}`)));
+  document.getElementById('role-summary').textContent =
+    `${state.players.length}人：` + Object.keys(ROLES).filter((r) => counts[r]).map((r) => `${ROLES[r]}${counts[r]}`).join(' ');
 
-  const tbody = document.getElementById('player-list');
-  tbody.replaceChildren(...state.players.map((p) => h('tr', {},
-    h('td', {}, h('input', { type: 'color', value: p.color, onchange: (e) => { p.color = e.target.value; commit(); } })),
-    h('td', {}, h('input', { type: 'text', value: p.name, onchange: (e) => { p.name = e.target.value; commit(); } })),
-    h('td', {}, h('select', { onchange: (e) => { p.role = e.target.value; commit(); } },
-      Object.entries(ROLES).map(([k, r]) => h('option', { value: k, selected: k === p.role }, r.name)))),
-    h('td', {}, h('input', { type: 'text', value: p.note || '', placeholder: '口調・性格など', oninput: (e) => { p.note = e.target.value; commit(false); } })),
-    h('td', {}, h('button', { class: 'small danger', title: '削除', onclick: () => removePlayer(p.id) }, '×')),
+  document.getElementById('player-list').replaceChildren(...state.players.map((p) => h('div', { class: 'row' },
+    h('input', { type: 'color', value: p.color, onchange: (e) => { p.color = e.target.value; commit(); } }),
+    h('input', { type: 'text', value: p.name, onchange: (e) => { p.name = e.target.value; commit(); } }),
+    h('select', { class: 'role', onchange: (e) => { p.role = e.target.value; commit(); } },
+      Object.entries(ROLES).map(([k, name]) => h('option', { value: k, selected: k === p.role }, name))),
+    h('button', { class: 'icon danger', onclick: () => { if (confirm(`${p.name} を削除しますか？`)) { state.players = state.players.filter((x) => x !== p); commit(); } } }, '×'),
   )));
+
+  document.getElementById('preset-select').replaceChildren(
+    presets.length ? null : h('option', { value: '' }, '（プリセットなし）'),
+    ...presets.map((ps, i) => h('option', { value: i }, `${ps.name}（${ps.members.length}人）`)));
 }
 
-function removePlayer(id) {
-  if (!confirm(`${pname(id)} を削除しますか？`)) return;
-  state.players = state.players.filter((p) => p.id !== id);
-  commit();
-}
-
-/* ===== ② シナリオ ===== */
+/* ===== シナリオ ===== */
 function renderScenario() {
-  const { results } = simulate();
-  const list = document.getElementById('day-list');
-  list.replaceChildren(...state.days.map((day, i) => renderDay(day, i, results[i])));
+  const sim = simulate();
+  document.getElementById('day-list').replaceChildren(
+    renderFirstNight(sim.first),
+    ...state.days.map((day, i) => renderDay(day, i, sim.days[i])));
+  document.getElementById('btn-add-day').hidden = !!sim.winner;
+}
+
+function deathNotes(deaths) {
+  return deaths.map((d) => note(`☠ ${pname(d.id)}（${d.cause}）`));
+}
+
+function winNote(w) {
+  const text = { village: '🎉 村人陣営の勝利', wolf: '🐺 人狼陣営の勝利', fox: '🦊 妖狐の勝利' }[w];
+  return note(text, `win ${w}`);
+}
+
+function renderFirstNight(r) {
+  const fn = state.firstNight;
+  const all = state.players.map((p) => p.id);
+  const card = h('div', { class: 'card' }, h('h2', {}, '初日の夜'));
+  card.append(field('初日犠牲者', playerSelect(fn.victim, all.filter((id) => !['werewolf', 'fox', 'nekomata'].includes(roleOf(id))), (v) => { fn.victim = v; commit(); })));
+  const seer = all.find((id) => roleOf(id) === 'seer' && id !== fn.victim);
+  if (seer) {
+    card.append(field('初日占い', playerSelect(fn.divine, all.filter((id) => id !== seer && id !== fn.victim), (v) => { fn.divine = v; commit(); })));
+  }
+  if (r.divine) card.append(note(`🔮 ${pname(r.divine.target)} は ${r.divine.result}`));
+  card.append(...deathNotes(r.deaths));
+  card.append(h('h3', {}, '台詞'), renderLines(fn.lines, all));
+  if (r.winner) card.append(winNote(r.winner));
+  return card;
 }
 
 function renderDay(day, i, r) {
   const n = i + 1;
-  const card = h('div', { class: 'card day' });
-  card.append(h('div', { class: 'card-head' },
-    h('h2', {}, `${n}日目`),
-    h('button', { class: 'small danger', onclick: () => { if (confirm(`${n}日目を削除しますか？`)) { state.days.splice(i, 1); if (!state.days.length) state.days.push(createDay()); commit(); } } }, 'この日を削除')));
-
+  const card = h('div', { class: 'card' }, h('h2', {}, `${n}日目`));
   if (r.skipped) {
-    card.append(h('div', { class: 'result' }, '（ゲームは既に終了しています）'));
+    card.append(note('（ゲーム終了済み）'), deleteDayButton(i));
     return card;
   }
+  const alive = r.aliveAtStart;
+  card.append(chips(alive));
 
-  card.append(h('div', { class: 'status' },
-    state.players.map((p) => chip(p.id, r.aliveAtStart.includes(p.id) ? '' : 'dead'))));
+  card.append(h('h3', {}, '☀ 昼'), renderLines(day.lines, alive));
 
-  // 昼：議論
-  card.append(h('h3', {}, '☀ 昼の議論'));
-  card.append(renderLines(day.lines, r.aliveAtStart));
-
-  // 投票
   card.append(h('h3', {}, '🗳 投票'));
-  card.append(h('div', { class: 'grid2' }, r.aliveAtStart.map((voter) => h('label', {},
-    h('span', {}, pname(voter)),
-    playerSelect(day.votes[voter] || '', r.aliveAtStart.filter((x) => x !== voter), (v) => { day.votes[voter] = v; commit(); }, '（未投票）')))));
-
-  const tallyText = Object.entries(r.tally.count).sort((a, b) => b[1] - a[1]).map(([id, c]) => `${pname(id)} ${c}票`).join(' / ') || '票なし';
-  card.append(h('div', { class: 'result' }, `集計：${tallyText}`));
-
-  const execSel = h('select', { onchange: (e) => { day.executed = e.target.value; commit(); } },
-    h('option', { value: 'auto', selected: day.executed === 'auto' }, '自動（最多票）'),
-    h('option', { value: 'none', selected: day.executed === 'none' }, '処刑なし'),
-    r.aliveAtStart.map((id) => h('option', { value: id, selected: day.executed === id }, pname(id))));
-  card.append(h('div', { class: 'grid2' }, h('label', {}, h('span', {}, '処刑者'), execSel)));
-
-  if (r.tally.executed) {
-    card.append(h('div', { class: 'result' }, `⚰ ${pname(r.tally.executed)} が処刑された（霊媒結果：${r.medium}）`));
-  } else if (day.executed === 'auto' && r.tally.top.length > 1) {
-    card.append(h('div', { class: 'result' }, `同票（${r.tally.top.map(pname).join('・')}）のため処刑者を手動で選んでください`));
+  alive.forEach((v) => card.append(field(pname(v),
+    playerSelect(day.votes[v] || '', alive.filter((x) => x !== v), (t) => { day.votes[v] = t; commit(); }, '（未投票）'))));
+  const counted = Object.entries(r.count).sort((a, b) => b[1] - a[1]).map(([id, c]) => `${pname(id)}${c}`).join(' / ');
+  card.append(note(`集計：${counted || '票なし'}`));
+  card.append(field('処刑', select(day.executed,
+    [['auto', '自動（最多票）'], ['none', 'なし'], ...alive.map((id) => [id, pname(id)])],
+    (v) => { day.executed = v; commit(); })));
+  if (day.executed === 'auto' && r.top.length > 1) card.append(note('同票です。処刑者を選んでください', 'warn'));
+  if (r.executed && roleOf(r.executed) === 'nekomata') {
+    card.append(field('猫又道連れ', playerSelect(day.nekoExec, alive.filter((id) => id !== r.executed), (v) => { day.nekoExec = v; commit(); }, '（選択）')));
   }
-
-  if (r.winnerAfterDay) {
-    card.append(winBox(r.winnerAfterDay));
+  if (r.needNekoExec) card.append(note('猫又の道連れ先を選んでください', 'warn'));
+  card.append(...deathNotes(r.deathsDay));
+  if (r.medium) card.append(note(`👻 霊能結果：${pname(r.executed)} は ${r.medium}`));
+  if (r.winnerDay) {
+    card.append(winNote(r.winnerDay), deleteDayButton(i));
     return card;
   }
 
-  // 夜
-  card.append(h('h3', {}, '🌙 夜の行動'));
-  const alive = r.aliveAtNight;
-  const hasRole = (role) => alive.some((id) => player(id).role === role);
-  const nightFields = [];
-  nightFields.push(h('label', {}, h('span', {}, '人狼の襲撃'), playerSelect(day.night.attack, alive.filter((id) => !isWolf(id)), (v) => { day.night.attack = v; commit(); }, '（なし）')));
-  if (hasRole('seer')) {
-    const seer = alive.find((id) => player(id).role === 'seer');
-    nightFields.push(h('label', {}, h('span', {}, '占い先'), playerSelect(day.night.divine, alive.filter((id) => id !== seer), (v) => { day.night.divine = v; commit(); }, '（なし）')));
+  card.append(h('h3', {}, '🌙 夜'));
+  const na = r.aliveAtNight;
+  const find = (role) => na.find((id) => roleOf(id) === role);
+  card.append(field('襲撃', playerSelect(day.night.attack, na.filter((id) => !isWolf(id)), (v) => { day.night.attack = v; commit(); })));
+  const seer = find('seer');
+  if (seer) card.append(field('占い', playerSelect(day.night.divine, na.filter((id) => id !== seer), (v) => { day.night.divine = v; commit(); })));
+  const hunter = find('hunter');
+  if (hunter) card.append(field('護衛', playerSelect(day.night.guard, na.filter((id) => id !== hunter), (v) => { day.night.guard = v; commit(); })));
+  if (roleOf(day.night.attack) === 'nekomata' && !r.attackFail) {
+    card.append(field('猫又道連れ', playerSelect(day.night.nekoWolf, na.filter(isWolf), (v) => { day.night.nekoWolf = v; commit(); }, '（選択）')));
   }
-  if (hasRole('knight')) {
-    const knight = alive.find((id) => player(id).role === 'knight');
-    nightFields.push(h('label', {}, h('span', {}, '護衛先'), playerSelect(day.night.guard, alive.filter((id) => id !== knight), (v) => { day.night.guard = v; commit(); }, '（なし）')));
-  }
-  card.append(h('div', { class: 'grid2' }, nightFields));
-
-  const nightResults = [];
-  if (r.divine) nightResults.push(`🔮 占い：${pname(day.night.divine)} は「${r.divine}」`);
-  if (r.guarded) nightResults.push(`🛡 ${pname(day.night.attack)} への襲撃は護衛により失敗（翌朝：犠牲者なし）`);
-  if (r.killed) nightResults.push(`🐺 ${pname(r.killed)} が襲撃された`);
-  if (!day.night.attack) nightResults.push('襲撃なし');
-  nightResults.forEach((t) => card.append(h('div', { class: 'result' }, t)));
-
-  card.append(h('h3', {}, '夜の会話・演出'));
-  card.append(renderLines(day.nightLines, alive));
-
-  if (r.winnerAfterNight) card.append(winBox(r.winnerAfterNight));
+  if (r.needNekoWolf) card.append(note('猫又の道連れ先（人狼）を選んでください', 'warn'));
+  if (r.divine) card.append(note(`🔮 ${pname(r.divine.target)} は ${r.divine.result}`));
+  if (r.attackFail) card.append(note(`🛡 襲撃失敗（${r.attackFail}）`));
+  card.append(...deathNotes(r.deathsNight));
+  if (day.night.attack && !r.attackFail && !r.deathsNight.length) card.append(note('平和な朝'));
+  card.append(h('h3', {}, '夜の台詞'), renderLines(day.nightLines, na));
+  if (r.winnerNight) card.append(winNote(r.winnerNight));
+  card.append(deleteDayButton(i));
   return card;
 }
 
-function winBox(winner) {
-  return h('div', { class: `result win ${winner === 'village' ? 'village' : ''}` },
-    winner === 'village' ? '🎉 村人陣営の勝利！' : '🐺 人狼陣営の勝利！');
+function deleteDayButton(i) {
+  return h('button', {
+    class: 'wide danger',
+    onclick: () => {
+      if (!confirm(`${i + 1}日目を削除しますか？`)) return;
+      state.days.splice(i, 1);
+      if (!state.days.length) state.days.push(createDay());
+      commit();
+    },
+  }, `${i + 1}日目を削除`);
 }
 
-/** 台詞リストの編集 UI */
+/** 台詞リスト */
 function renderLines(lines, speakers) {
-  const wrap = h('div', { class: 'lines' });
+  const wrap = h('div');
   lines.forEach((line, idx) => {
     const move = (d) => {
       const j = idx + d;
@@ -287,121 +327,119 @@ function renderLines(lines, speakers) {
     };
     const ids = [...new Set([...speakers, line.speaker].filter(Boolean))];
     wrap.append(h('div', { class: 'line' },
-      playerSelect(line.speaker, ids, (v) => { line.speaker = v; commit(); }, 'ナレーション'),
-      h('textarea', { rows: 1, value: line.text, placeholder: '台詞・ト書き', oninput: (e) => { line.text = e.target.value; commit(false); } }),
-      h('div', { class: 'ops' },
-        h('button', { class: 'small', title: '上へ', onclick: () => move(-1) }, '↑'),
-        h('button', { class: 'small', title: '下へ', onclick: () => move(1) }, '↓'),
-        h('button', { class: 'small danger', title: '削除', onclick: () => { lines.splice(idx, 1); commit(); } }, '×'))));
+      h('div', { class: 'row' },
+        playerSelect(line.speaker, ids, (v) => { line.speaker = v; commit(); }, 'ナレーション'),
+        h('button', { class: 'icon', onclick: () => move(-1) }, '↑'),
+        h('button', { class: 'icon', onclick: () => move(1) }, '↓'),
+        h('button', { class: 'icon danger', onclick: () => { lines.splice(idx, 1); commit(); } }, '×')),
+      h('textarea', { rows: 2, value: line.text, oninput: (e) => { line.text = e.target.value; commit(false); } })));
   });
-  wrap.append(h('div', {}, h('button', { class: 'small', onclick: () => { lines.push({ id: uid(), speaker: '', text: '' }); commit(); } }, '＋ 台詞を追加')));
+  wrap.append(h('button', { class: 'wide', onclick: () => { lines.push({ speaker: '', text: '' }); commit(); } }, '＋ 台詞'));
   return wrap;
 }
 
-/* ===== ③ 台本プレビュー ===== */
+/* ===== 台本 ===== */
 function buildScript() {
-  const { results, winner } = simulate();
+  const sim = simulate();
   const out = [];
-  const lineText = (l) => (l.speaker ? `${pname(l.speaker)}「${l.text}」` : `（${l.text}）`);
-  out.push(`■ ${state.title || '無題のシナリオ'}`);
-  if (state.memo) out.push(state.memo);
-  out.push('');
-  out.push('【配役】');
-  state.players.forEach((p) => out.push(`・${p.name}：${ROLES[p.role].name}${p.note ? `（${p.note}）` : ''}`));
+  const say = (lines) => lines.filter((l) => l.text).forEach((l) => out.push(l.speaker ? `${pname(l.speaker)}「${l.text}」` : `（${l.text}）`));
+  const deaths = (ds) => ds.forEach((d) => out.push(`［${d.cause}］${pname(d.id)}`));
+
+  out.push(`■ ${state.title || '無題'}`, '', '【配役】');
+  state.players.forEach((p) => out.push(`${p.name}：${ROLES[p.role]}`));
+
+  out.push('', '―― 初日の夜 ――');
+  say(state.firstNight.lines);
+  if (sim.first.divine) out.push(`［占い］${pname(sim.first.divine.target)}→${sim.first.divine.result}`);
+  deaths(sim.first.deaths);
 
   state.days.forEach((day, i) => {
-    const r = results[i];
+    const r = sim.days[i];
     if (r.skipped) return;
-    out.push('', `━━━━ ${i + 1}日目 昼 ━━━━`);
-    out.push(`生存者：${r.aliveAtStart.map(pname).join('、')}`);
-    day.lines.filter((l) => l.text).forEach((l) => out.push(lineText(l)));
+    out.push('', `―― ${i + 1}日目 昼 ――`);
+    say(day.lines);
     const votes = r.aliveAtStart.filter((v) => day.votes[v]).map((v) => `${pname(v)}→${pname(day.votes[v])}`);
     if (votes.length) out.push(`［投票］${votes.join('、')}`);
-    if (r.tally.executed) out.push(`［処刑］${pname(r.tally.executed)}`);
-    if (r.winnerAfterDay) return;
-    out.push('', `━━━━ ${i + 1}日目 夜 ━━━━`);
-    day.nightLines.filter((l) => l.text).forEach((l) => out.push(lineText(l)));
-    if (r.divine) out.push(`［占い］${pname(day.night.divine)}：${r.divine}`);
-    if (r.guarded) out.push(`［護衛成功］${pname(day.night.guard)}`);
-    if (r.killed) out.push(`［襲撃］${pname(r.killed)}`);
+    deaths(r.deathsDay);
+    if (r.medium) out.push(`［霊能］${pname(r.executed)}→${r.medium}`);
+    if (r.winnerDay) return;
+    out.push('', `―― ${i + 1}日目 夜 ――`);
+    say(day.nightLines);
+    if (r.divine) out.push(`［占い］${pname(r.divine.target)}→${r.divine.result}`);
+    if (r.attackFail) out.push(`［襲撃失敗］${r.attackFail}`);
+    deaths(r.deathsNight);
   });
-  out.push('');
-  out.push(winner ? `★ ${winner === 'village' ? '村人' : '人狼'}陣営の勝利` : '（決着していません）');
+  const w = { village: '村人陣営の勝利', wolf: '人狼陣営の勝利', fox: '妖狐の勝利' }[sim.winner];
+  out.push('', w ? `★ ${w}` : '（未決着）');
   return out.join('\n');
-}
-
-function renderPreview() {
-  document.getElementById('preview').textContent = buildScript();
 }
 
 /* ===== 全体 ===== */
 function render() {
   renderSetup();
   renderScenario();
-  renderPreview();
+  document.getElementById('preview').textContent = buildScript();
 }
 
 function bindEvents() {
+  const $ = (id) => document.getElementById(id);
+
   document.querySelectorAll('.tab').forEach((tab) => tab.addEventListener('click', () => {
     document.querySelectorAll('.tab, .tab-panel').forEach((el) => el.classList.remove('active'));
     tab.classList.add('active');
-    document.getElementById(`tab-${tab.dataset.tab}`).classList.add('active');
+    $(`tab-${tab.dataset.tab}`).classList.add('active');
     render();
+    window.scrollTo(0, 0);
   }));
 
-  document.getElementById('title').addEventListener('input', (e) => { state.title = e.target.value; commit(false); });
-  document.getElementById('memo').addEventListener('input', (e) => { state.memo = e.target.value; commit(false); });
+  $('title').addEventListener('input', (e) => { state.title = e.target.value; commit(false); });
 
-  document.getElementById('btn-add-player').addEventListener('click', () => {
+  $('btn-add-player').addEventListener('click', () => {
     const i = state.players.length;
-    state.players.push({ id: uid(), name: `キャラ${i + 1}`, role: 'villager', color: DEFAULT_COLORS[i % DEFAULT_COLORS.length], note: '' });
+    state.players.push({ id: uid(), name: `キャラ${i + 1}`, role: 'villager', color: COLORS[i % COLORS.length] });
     commit();
   });
 
-  document.getElementById('btn-random-roles').addEventListener('click', () => {
-    const roles = state.players.map((p) => p.role);
-    for (let i = roles.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [roles[i], roles[j]] = [roles[j], roles[i]];
-    }
-    state.players.forEach((p, i) => { p.role = roles[i]; });
+  $('btn-preset-save').addEventListener('click', () => {
+    const name = prompt('プリセット名', state.title || 'メンバー');
+    if (!name) return;
+    presets.push({ name, members: state.players.map(({ name: n, color }) => ({ name: n, color })) });
+    saveJSON(PRESET_KEY, presets);
+    render();
+  });
+
+  $('btn-preset-load').addEventListener('click', () => {
+    const ps = presets[$('preset-select').value];
+    if (!ps || !confirm(`「${ps.name}」でメンバーを置き換えますか？（役職は今の並び順のまま引き継ぎます）`)) return;
+    state.players = ps.members.map((m, i) => ({
+      id: state.players[i] ? state.players[i].id : uid(), name: m.name, color: m.color, role: state.players[i] ? state.players[i].role : 'villager',
+    }));
     commit();
   });
 
-  document.getElementById('btn-add-day').addEventListener('click', () => { state.days.push(createDay()); commit(); });
+  $('btn-preset-delete').addEventListener('click', () => {
+    const i = $('preset-select').value;
+    if (!presets[i] || !confirm(`「${presets[i].name}」を削除しますか？`)) return;
+    presets.splice(i, 1);
+    saveJSON(PRESET_KEY, presets);
+    render();
+  });
 
-  document.getElementById('btn-copy').addEventListener('click', async () => {
+  $('btn-reset').addEventListener('click', () => {
+    if (!confirm('シナリオを初期状態に戻しますか？（プリセットは残ります）')) return;
+    state = createInitialState();
+    commit();
+  });
+
+  $('btn-add-day').addEventListener('click', () => { state.days.push(createDay()); commit(); });
+
+  $('btn-copy').addEventListener('click', async () => {
     try {
       await navigator.clipboard.writeText(buildScript());
       alert('コピーしました');
     } catch (e) {
       alert('コピーに失敗しました');
     }
-  });
-
-  document.getElementById('btn-export').addEventListener('click', () => {
-    const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
-    const a = h('a', { href: URL.createObjectURL(blob), download: `${state.title || 'jinro-scenario'}.json` });
-    a.click();
-    setTimeout(() => URL.revokeObjectURL(a.href), 1000);
-  });
-
-  document.getElementById('input-import').addEventListener('change', async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    try {
-      state = normalize(JSON.parse(await file.text()));
-      commit();
-    } catch (err) {
-      alert('読み込みに失敗しました: ' + err.message);
-    }
-    e.target.value = '';
-  });
-
-  document.getElementById('btn-reset').addEventListener('click', () => {
-    if (!confirm('すべての内容を初期状態に戻しますか？')) return;
-    state = createInitialState();
-    commit();
   });
 }
 
